@@ -36,6 +36,8 @@ pub enum LoaderError {
     ParseIntError(#[from] std::num::ParseIntError),
     #[error("failed to parse regex")]
     RegexError(#[from] regex::Error),
+    #[error("unsupported adapter: {0}")]
+    UnsupportedAdapter(String),
 }
 
 pub type ReaderTensor<'a> = (Dtype, Vec<usize>, Cow<'a, [u8]>);
@@ -193,8 +195,58 @@ struct LoraVector {
 struct LoraMatrix {
     x: TensorGpu<f16, ReadWrite>,
     y: TensorGpu<f16, ReadWrite>,
-    rank: usize,
-    alpha: f32,
+    /// The factor multiplied to `x^T y` before adding it to the matrix.
+    scale: f32,
+}
+
+/// Read a tensor of any float type into `f32`s.
+fn reader_to_f32((dt, shape, data): ReaderTensor) -> Result<(Vec<usize>, Vec<f32>), LoaderError> {
+    let data = match dt {
+        Dtype::F16 => bytemuck::pod_collect_to_vec::<u8, f16>(&data)
+            .into_iter()
+            .map(f16::to_f32)
+            .collect(),
+        Dtype::BF16 => bytemuck::pod_collect_to_vec::<u8, half::bf16>(&data)
+            .into_iter()
+            .map(half::bf16::to_f32)
+            .collect(),
+        Dtype::F32 => bytemuck::pod_collect_to_vec::<u8, f32>(&data),
+        _ => Err(TensorError::from(TensorErrorKind::Type))?,
+    };
+    Ok((shape, data))
+}
+
+/// Build the LoRA factors equivalent to a MiSS block.
+///
+/// MiSS (Matrix Shard Sharing) learns a single block `D` of shape `[r, d]` (PyTorch order) and adds
+/// `ΔW[o, i] = D[i % r, o % d]` to a weight `W` of shape `[out, in]`, where `d` is either `out`
+/// (default) or `mini_r` (`mini` mode). This equals `X^T Y` with `X[k, i] = [i % r == k]` and
+/// `Y[k, o] = D[k, o % d]`, so it can be merged by [`TensorOp::blend_lora`].
+///
+/// Returns `(x, y, k)` where `x` has shape `[k, in]`, `y` has shape `[k, out]`, and `k` is `r`
+/// padded to a multiple of 4.
+fn miss_factors(
+    block: &[f32],
+    r: usize,
+    d: usize,
+    num_in: usize,
+    num_out: usize,
+) -> (Vec<f16>, Vec<f16>, usize) {
+    let k = r.next_multiple_of(4);
+
+    let mut x = vec![f16::ZERO; k * num_in];
+    for i in 0..num_in {
+        x[i * k + i % r] = f16::ONE;
+    }
+
+    let mut y = vec![f16::ZERO; k * num_out];
+    for o in 0..num_out {
+        for j in 0..r {
+            y[o * k + j] = f16::from_f32(block[j * d + o % d]);
+        }
+    }
+
+    (x, y, k)
 }
 
 #[derive(Clone)]
@@ -353,6 +405,9 @@ impl<R: Reader> Loader<R> {
 
     /// Load all lora and blend factors about the matrix with a given name.
     /// In each LoRA, only the last matched pattern is loaded.
+    ///
+    /// Besides LoRA (`{name}.lora.0` and `{name}.lora.1`), MiSS blocks (`{name}.miss_block`, optionally
+    /// prefixed with `base_model.model.` as saved by PEFT) are loaded as equivalent LoRA factors.
     fn lora_matrices(&self, name: impl AsRef<str>) -> Result<Vec<LoraMatrix>, LoaderError> {
         let context = &self.context;
         let name = name.as_ref();
@@ -367,21 +422,54 @@ impl<R: Reader> Loader<R> {
                 continue;
             };
 
-            let name = name.split('.').filter(|x| !x.contains("weight")).join(".");
-            let Ok(x) = lora.data.tensor(&format!("{name}.lora.0")) else {
-                continue;
-            };
-            let Ok(y) = lora.data.tensor(&format!("{name}.lora.1")) else {
-                continue;
-            };
-
-            let rank = x.1[1];
             let alpha = blend.alpha;
-            let x = TensorCpu::from_reader(x)?.to(context);
-            let y = TensorCpu::from_reader(y)?.to(context);
-            matrices.push(LoraMatrix { x, y, rank, alpha });
+            let base = name.split('.').filter(|x| !x.contains("weight")).join(".");
 
-            log::info!("matrix (LoRA) {name}, alpha: {alpha}, rank: {rank}");
+            if let (Ok(x), Ok(y)) = (
+                lora.data.tensor(&format!("{base}.lora.0")),
+                lora.data.tensor(&format!("{base}.lora.1")),
+            ) {
+                let rank = x.1[1];
+                let x = TensorCpu::from_reader(x)?.to(context);
+                let y = TensorCpu::from_reader(y)?.to(context);
+                let scale = alpha / rank as f32;
+                matrices.push(LoraMatrix { x, y, scale });
+
+                log::info!("matrix (LoRA) {base}, alpha: {alpha}, rank: {rank}");
+            }
+
+            let block = [
+                format!("{base}.miss_block"),
+                format!("base_model.model.{base}.miss_block"),
+            ]
+            .into_iter()
+            .find_map(|key| lora.data.tensor(&key).ok());
+            if let Some(block) = block {
+                let (shape, block) = reader_to_f32(block)?;
+                let &[r, d] = shape.as_slice() else {
+                    return Err(LoaderError::UnsupportedAdapter(format!(
+                        "MiSS block of {base} has shape {shape:?}; only default and mini modes are supported"
+                    )));
+                };
+                let [num_out, num_in] = self.model.shape(name)?[..] else {
+                    return Err(LoaderError::UnsupportedAdapter(format!(
+                        "MiSS target {name} is not a matrix"
+                    )));
+                };
+                if r == 0 || d == 0 || num_out % d != 0 {
+                    return Err(LoaderError::UnsupportedAdapter(format!(
+                        "MiSS block of {base} has shape {shape:?}, incompatible with [{num_out}, {num_in}]"
+                    )));
+                }
+
+                let (x, y, k) = miss_factors(&block, r, d, num_in, num_out);
+                let x = context.tensor_from_data([k, num_in, 1, 1], x)?;
+                let y = context.tensor_from_data([k, num_out, 1, 1], y)?;
+                let scale = alpha;
+                matrices.push(LoraMatrix { x, y, scale });
+
+                log::info!("matrix (MiSS) {base}, alpha: {alpha}, rank: {r}");
+            }
         }
         Ok(matrices)
     }
@@ -575,7 +663,7 @@ impl<R: Reader> Loader<R> {
 
         let mut ops = vec![];
         for lora in self.lora_matrices(name.as_ref())? {
-            let factor = vec![lora.alpha / lora.rank as f32, 1.0, 0.0, 0.0];
+            let factor = vec![lora.scale, 1.0, 0.0, 0.0];
             let factor = context.tensor_from_data([4, 1, 1, 1], factor)?;
             let op = TensorOp::blend_lora(&factor, &lora.x, &lora.y, &tensor)?;
             ops.push(op);
@@ -604,7 +692,7 @@ impl<R: Reader> Loader<R> {
 
         let mut ops = vec![];
         for lora in self.lora_matrices(name.as_ref())? {
-            let factor = vec![discount * lora.alpha / lora.rank as f32, 1.0, 0.0, 0.0];
+            let factor = vec![discount * lora.scale, 1.0, 0.0, 0.0];
             let factor = context.tensor_from_data([4, 1, 1, 1], factor)?;
             let op = TensorOp::blend_lora(&factor, &lora.x, &lora.y, &tensor)?;
             ops.push(op);
@@ -632,7 +720,7 @@ impl<R: Reader> Loader<R> {
 
         let mut ops = vec![];
         for lora in self.lora_matrices(name.as_ref())? {
-            let factor = vec![lora.alpha / lora.rank as f32, 1.0, 0.0, 0.0];
+            let factor = vec![lora.scale, 1.0, 0.0, 0.0];
             let factor = context.tensor_from_data([4, 1, 1, 1], factor)?;
             let op = TensorOp::blend_lora(&factor, &lora.x, &lora.y, matrix)?;
             ops.push(op);
@@ -669,7 +757,7 @@ impl<R: Reader> Loader<R> {
 
         let mut ops = vec![];
         for lora in self.lora_matrices(name.as_ref())? {
-            let factor = vec![discount * lora.alpha / lora.rank as f32, 1.0, 0.0, 0.0];
+            let factor = vec![discount * lora.scale, 1.0, 0.0, 0.0];
             let factor = context.tensor_from_data([4, 1, 1, 1], factor)?;
             let op = TensorOp::blend_lora(&factor, &lora.x, &lora.y, matrix)?;
             ops.push(op);
@@ -759,5 +847,102 @@ impl<R: Reader> Loader<R> {
                 Ok(Matrix::quant_sf4(&buffer, 5.0)?)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use half::f16;
+    use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+    use wgpu::{Instance, PowerPreference};
+
+    use super::{Loader, Lora, LoraBlend};
+    use crate::context::{Context, ContextBuilder, InstanceExt};
+
+    async fn create_context() -> Result<Context> {
+        let instance = Instance::default();
+        let adapter = instance.adapter(PowerPreference::HighPerformance).await?;
+        let context = ContextBuilder::new(adapter).build().await?;
+        Ok(context)
+    }
+
+    fn bytes<T: bytemuck::Pod>(data: &[T]) -> Vec<u8> {
+        bytemuck::cast_slice(data).to_vec()
+    }
+
+    /// Merge a MiSS block into a `[out, in]` matrix and compare against PEFT's reference merge,
+    /// `ΔW[o, i] = D[i % r, o % d]`.
+    async fn check_miss(num_out: usize, num_in: usize, r: usize, d: usize) -> Result<()> {
+        let context = create_context().await?;
+        let name = "blocks.0.att.key.weight";
+        let alpha = 0.5;
+
+        let w = (0..num_out * num_in)
+            .map(|x| f16::from_f32(((x % 13) as f32 - 6.0) / 8.0))
+            .collect::<Vec<_>>();
+        let block = (0..r * d)
+            .map(|x| ((x % 7) as f32 - 3.0) / 4.0)
+            .collect::<Vec<_>>();
+
+        let w_bytes = bytes(&w);
+        let model = safetensors::serialize(
+            [(
+                name,
+                TensorView::new(Dtype::F16, vec![num_out, num_in], &w_bytes)?,
+            )],
+            None,
+        )?;
+        let block_bytes = bytes(&block);
+        let adapter = safetensors::serialize(
+            [(
+                "base_model.model.blocks.0.att.key.miss_block",
+                TensorView::new(Dtype::F32, vec![r, d], &block_bytes)?,
+            )],
+            None,
+        )?;
+
+        let model = SafeTensors::deserialize(&model)?;
+        let adapter = SafeTensors::deserialize(&adapter)?;
+        let loader = Loader {
+            context: context.clone(),
+            model,
+            lora: vec![Lora {
+                data: adapter,
+                blend: LoraBlend::full(alpha),
+            }],
+        };
+
+        let output = loader.load_matrix_f16(name)?.back().await.to_vec();
+        for o in 0..num_out {
+            for i in 0..num_in {
+                let expected = w[o * num_in + i].to_f32() + alpha * block[(i % r) * d + o % d];
+                let actual = output[o * num_in + i].to_f32();
+                assert!(
+                    (expected - actual).abs() < 1e-2,
+                    "[{o}, {i}]: expected {expected}, got {actual}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_miss_default() -> Result<()> {
+        check_miss(40, 64, 8, 40).await
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_miss_remainder() -> Result<()> {
+        // `in % r != 0` and `r % 4 != 0`
+        check_miss(36, 68, 6, 36).await
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_miss_mini() -> Result<()> {
+        check_miss(48, 64, 8, 4).await
     }
 }

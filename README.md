@@ -15,7 +15,7 @@ This is an inference engine for the [language model of RWKV](https://github.com/
 - Batched inference.
 - Int8 and Float4 quantization.
 - Very fast.
-- LoRA merging at loading time.
+- LoRA and MiSS merging at loading time.
 - Support RWKV V4 through V7.
 - Hooks to intervene the inference process at any point.
 - Model (de)serialization.
